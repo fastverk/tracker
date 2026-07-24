@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight runs when a new commit lands on the same ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: bazel test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds everything, including the tracker-gateway OCI image.
+          - os: ubuntu-latest
+            targets: "//..."
+          # rules_oci publishes no macOS platform, so `//...` cannot even ANALYZE
+          # the image targets on darwin. Test the code instead — //:tracker_test
+          # compiles the whole crate (lib + gateway) and runs the unit tests, and
+          # //:conformance runs the contract battery; the image is a linux deploy
+          # artifact, covered by the ubuntu job.
+          - os: macos-latest
+            targets: "//:tracker_test //:conformance"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazel-contrib/setup-bazel@0.10.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}-${{ matrix.os }}
+          repository-cache: true
+      - run: bazel test ${{ matrix.targets }} --test_output=errors
+
+  buildifier:
+    name: buildifier lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install buildifier
+        run: |
+          curl -fsSL -o /usr/local/bin/buildifier \
+            https://github.com/bazelbuild/buildtools/releases/download/v7.3.1/buildifier-linux-amd64
+          chmod +x /usr/local/bin/buildifier
+      - run: buildifier --mode=check --lint=warn -r .
