@@ -14,7 +14,7 @@
 # a cargo_build_script, so the only Bazel codegen dep is protobuf (for protoc).
 module(
     name = "tracker",
-    version = "0.0.2",
+    version = "0.0.3",
 )
 
 bazel_dep(name = "platforms", version = "1.0.0")

@@ -28,8 +28,11 @@
 //! would turn a narrow campaign into fan-out over the whole backlog. It is
 //! declared `false` in [`Tracker::capabilities`] so a caller can check first.
 
+use std::sync::OnceLock;
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use tokio::runtime::{Builder, Runtime};
 
 use crate::{
     ChangeLink, LinkedChange, PostedComment, Priority, Project, StateCategory, Tracker,
@@ -72,11 +75,55 @@ const ISSUE_FIELDS: &str = r#"
   attachments { nodes { url } }
 "#;
 
+/// A Tokio runtime owned by THIS crate, on which every Linear HTTP request runs.
+///
+/// # Why a library owns a runtime
+///
+/// This looks wrong until you hit it. Under Bazel each module resolves its
+/// dependencies through its OWN `crate_universe`, so `tracker`'s reqwest/hyper
+/// link against **`tracker`'s** tokio while an in-process consumer awaits on
+/// **its own** tokio. Two distinct tokio crates mean two distinct reactor
+/// thread-locals — so the moment hyper's DNS resolver runs on the caller's
+/// runtime it panics:
+///
+/// ```text
+/// thread 'tokio-rt-worker' panicked at .../hyper-util/src/client/legacy/connect/dns.rs
+/// there is no reactor running, must be called from the context of a Tokio 1.x runtime
+/// ```
+///
+/// It is not a hypothetical: it took down the first live backlog dispatch, and
+/// the same signature is why the `wave-discover` CronJob has been panicking.
+/// The panic happens on a worker thread, so the pod stays up and the caller just
+/// sees a cancelled stream — which is the worst way to learn about it.
+///
+/// Running our HTTP on a runtime we own removes the coupling entirely: the
+/// reactor hyper needs is the one it was compiled against. The cost is two
+/// background threads per process.
+fn http_rt() -> &'static Runtime {
+    static HTTP_RT: OnceLock<Runtime> = OnceLock::new();
+    HTTP_RT.get_or_init(|| {
+        Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("tracker-http")
+            .build()
+            .expect("build the tracker HTTP runtime")
+    })
+}
+
+/// The shared HTTP client, built INSIDE [`http_rt`] for the same reason.
+///
+/// Shared across adapters on purpose: it carries no credential (auth is a
+/// per-request header), so one pool serves every caller.
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
 /// [`Tracker`] over Linear.
 pub struct LinearTracker {
     token: String,
     endpoint: String,
-    http: reqwest::Client,
 }
 
 impl LinearTracker {
@@ -91,7 +138,6 @@ impl LinearTracker {
         Self {
             token: token.into(),
             endpoint: endpoint.into(),
-            http: reqwest::Client::new(),
         }
     }
 
@@ -111,39 +157,53 @@ impl LinearTracker {
     /// application-level failures, so checking the HTTP status alone reports
     /// success on a failed query. Both paths are checked here.
     async fn graphql(&self, query: &str, variables: Value) -> TrackerResult<Value> {
-        let resp = self
-            .http
-            .post(&self.endpoint)
-            .header("Authorization", self.auth_header())
-            .header("Content-Type", "application/json")
-            .json(&json!({ "query": query, "variables": variables }))
-            .send()
+        let endpoint = self.endpoint.clone();
+        let auth = self.auth_header();
+        let payload = json!({ "query": query, "variables": variables });
+
+        // Hand the whole request to the runtime this crate owns (see `http_rt`)
+        // and await the JoinHandle from the caller's runtime. Awaiting a
+        // JoinHandle needs no reactor of its own — it is a completion channel —
+        // so this is the one boundary that crosses cleanly.
+        http_rt()
+            .spawn(async move {
+                let resp = http_client()
+                    .post(&endpoint)
+                    .header("Authorization", auth)
+                    .header("Content-Type", "application/json")
+                    .json(&payload)
+                    .send()
+                    .await
+                    .map_err(|e| TrackerError::msg(format!("linear request failed: {e}")))?;
+
+                let status = resp.status();
+                let body: Value = resp.json().await.map_err(|e| {
+                    TrackerError::msg(format!("linear returned non-JSON ({status}): {e}"))
+                })?;
+
+                // Linear answers 200 OK with a populated `errors` array for most
+                // application-level failures, so checking the HTTP status alone
+                // reports success on a failed query. Both paths are checked.
+                if let Some(errors) = body.get("errors").and_then(Value::as_array) {
+                    if !errors.is_empty() {
+                        let joined = errors
+                            .iter()
+                            .filter_map(|e| e.get("message").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        return Err(TrackerError::msg(format!("linear GraphQL error: {joined}")));
+                    }
+                }
+                if !status.is_success() {
+                    return Err(TrackerError::msg(format!("linear HTTP {status}")));
+                }
+
+                body.get("data")
+                    .cloned()
+                    .ok_or_else(|| TrackerError::msg("linear response had no data"))
+            })
             .await
-            .map_err(|e| TrackerError::msg(format!("linear request failed: {e}")))?;
-
-        let status = resp.status();
-        let body: Value = resp
-            .json()
-            .await
-            .map_err(|e| TrackerError::msg(format!("linear returned non-JSON ({status}): {e}")))?;
-
-        if let Some(errors) = body.get("errors").and_then(Value::as_array) {
-            if !errors.is_empty() {
-                let joined = errors
-                    .iter()
-                    .filter_map(|e| e.get("message").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                return Err(TrackerError::msg(format!("linear GraphQL error: {joined}")));
-            }
-        }
-        if !status.is_success() {
-            return Err(TrackerError::msg(format!("linear HTTP {status}")));
-        }
-
-        body.get("data")
-            .cloned()
-            .ok_or_else(|| TrackerError::msg("linear response had no data"))
+            .map_err(|e| TrackerError::msg(format!("linear request task failed: {e}")))?
     }
 
     /// Resolve a reference to Linear's own issue UUID.
@@ -749,6 +809,53 @@ fn build_filter(q: &WorkItemQuery) -> TrackerResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serve one canned HTTP response and return the address to point at.
+    async fn serve_once(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let _ = sock.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// The request completes when driven from a runtime that is NOT the one the
+    /// HTTP stack runs on.
+    ///
+    /// This is the regression guard for the two-runtime panic documented on
+    /// [`http_rt`]: a Bazel consumer awaits on its own tokio while this crate's
+    /// hyper needs the reactor it was compiled against. In-crate both tokios are
+    /// the same, so this cannot reproduce the panic itself — what it DOES pin is
+    /// that the request survives the spawn/JoinHandle hop, which is the
+    /// mechanism the fix relies on.
+    #[tokio::test]
+    async fn graphql_completes_across_the_runtime_hop() {
+        let endpoint = serve_once(r#"{"data":{"ok":true}}"#).await;
+        let t = LinearTracker::with_endpoint("lin_api_x", endpoint);
+        let data = t.graphql("{ ok }", json!({})).await.unwrap();
+        assert_eq!(data["ok"], true);
+    }
+
+    /// Linear answers 200 OK with a populated `errors` array, so a status-only
+    /// check reports success on a failed query.
+    #[tokio::test]
+    async fn a_200_with_a_graphql_errors_array_is_an_error() {
+        let endpoint = serve_once(r#"{"errors":[{"message":"boom"}]}"#).await;
+        let t = LinearTracker::with_endpoint("lin_api_x", endpoint);
+        let err = t.graphql("{ ok }", json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("boom"), "got {err}");
+    }
 
     #[test]
     fn auth_scheme_is_picked_by_token_prefix() {
