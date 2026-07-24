@@ -156,6 +156,11 @@ message WorkItem {
   // Display name or handle; "" when unassigned.
   string assignee = 7;
   string author = 8;
+  // The assignee's email, when the provider exposes it. Carried alongside the
+  // handle because the handle is not a stable identity — see
+  // WorkItemQuery.assignees. A caller scoping a per-person view should compare
+  // on this, not on `assignee`.
+  string assignee_email = 18;
 
   // Provider estimate in its own unit (points, days). 0 = unset. Advisory: it
   // is a planning signal, never a budget the scheduler enforces.
@@ -220,7 +225,12 @@ message WorkItemQuery {
   // Labels the item must carry (ALL of them — an "agent/ready" gate is the
   // intended use).
   repeated string labels = 3;
-  // Assignee handles; empty = any, including unassigned.
+  // Assignee identities — an EMAIL or a display handle; empty = any, including
+  // unassigned. Adapters must accept either and match exactly.
+  //
+  // Prefer email. A display handle is not a safe identity: one real workspace
+  // has both a `marsh` (Matt Marshall) and a `matt` (Matthew Almeida), so
+  // scoping a personal view by handle silently returns a colleague's work.
   repeated string assignees = 4;
   // RFC 3339 lower bound on `updated_at`.
   string updated_since = 5;

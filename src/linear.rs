@@ -66,7 +66,7 @@ const ISSUE_FIELDS: &str = r#"
   priority
   state { id name type }
   labels { nodes { name } }
-  assignee { displayName }
+  assignee { displayName email }
   creator { displayName }
   team { key }
   parent { id identifier team { key } }
@@ -724,6 +724,7 @@ fn issue_to_work_item(n: &Value, tracker: &TrackerRef) -> WorkItem {
         priority: priority_from(n.get("priority").and_then(Value::as_i64).unwrap_or(0)) as i32,
         labels,
         assignee: nested_str(n, "/assignee/displayName"),
+        assignee_email: nested_str(n, "/assignee/email"),
         author: nested_str(n, "/creator/displayName"),
         estimate: n.get("estimate").and_then(Value::as_f64).unwrap_or(0.0),
         url: str_at(n, "url"),
@@ -784,7 +785,18 @@ fn build_filter(q: &WorkItemQuery) -> TrackerResult<Value> {
     }
 
     if !q.assignees.is_empty() {
-        and.push(json!({ "assignee": { "displayName": { "in": q.assignees } } }));
+        // Match on EITHER email or display name.
+        //
+        // Display name alone is not a safe identity: this workspace has a
+        // `marsh` (Matt Marshall) and a `matt` (Matthew Almeida), so scoping a
+        // personal view by name silently returns a colleague's work. A caller
+        // that knows an email — which is what the console forwards as
+        // X-Fastverk-User-Email — gets an exact match; one that only has a
+        // handle still works.
+        and.push(json!({ "or": [
+            { "assignee": { "email":       { "in": q.assignees } } },
+            { "assignee": { "displayName": { "in": q.assignees } } },
+        ]}));
     }
 
     if !q.updated_since.is_empty() {
@@ -884,6 +896,22 @@ mod tests {
         assert_eq!(category_of("completed"), StateCategory::Done);
         assert_eq!(category_of("canceled"), StateCategory::Canceled);
         assert_eq!(category_of("invented"), StateCategory::Unspecified);
+    }
+
+    #[test]
+    fn assignees_match_on_email_or_handle_not_handle_alone() {
+        // A handle is not an identity: this workspace has both `marsh` (Matt
+        // Marshall) and `matt` (Matthew Almeida). Scoping by handle alone
+        // returns the wrong person's work.
+        let q = WorkItemQuery {
+            assignees: vec!["mmarshall@savvifi.com".into()],
+            ..Default::default()
+        };
+        let f = build_filter(&q).unwrap();
+        let alts = f["and"][0]["or"].as_array().unwrap();
+        assert_eq!(alts.len(), 2);
+        assert_eq!(alts[0]["assignee"]["email"]["in"][0], "mmarshall@savvifi.com");
+        assert_eq!(alts[1]["assignee"]["displayName"]["in"][0], "mmarshall@savvifi.com");
     }
 
     #[test]
