@@ -1,0 +1,99 @@
+"""tracker — generic work-tracker contract (TrackerService) + provider adapters.
+
+Single crate at the repo root, mirroring the sibling `forge` module. The proto is
+compiled by build.rs (tonic-build) under a cargo_build_script; protoc comes from
+@protobuf. `@tracker//:tracker` is the rust_library other fastverk modules (the
+agents campaign controller, plugin-tracker) depend on."""
+
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("//tools/oci:defs.bzl", "rust_service_image")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["MODULE.bazel"])
+
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+    build_script_env = {
+        "PROTOC": "$(execpath @protobuf//:protoc)",
+    },
+    data = ["//proto/tracker/v1:tracker.proto"],
+    edition = "2021",
+    tools = ["@protobuf//:protoc"],
+    deps = all_crate_deps(build = True),
+)
+
+rust_library(
+    name = "tracker",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/bin/**"],
+    ),
+    crate_root = "src/lib.rs",
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = [":build_script"] + all_crate_deps(normal = True),
+)
+
+# The tracker-gateway daemon: serves tracker.v1.TrackerService over the Tracker
+# trait (Linear adapter today), per-request identity from gRPC metadata. Consumed
+# by the agents campaign controller and by plugin-tracker's agent-callable MCP
+# tools.
+rust_binary(
+    name = "tracker-gateway",
+    srcs = ["src/bin/tracker-gateway.rs"],
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = [":tracker"] + all_crate_deps(normal = True),
+)
+
+# The tracker-gateway OCI image (distroless/cc + the binary). Built on RBE; the
+# build-runner pushes //:tracker-gateway-image_push to $ECR/tracker-gateway:<sha>.
+rust_service_image(
+    name = "tracker-gateway-image",
+    binary = ":tracker-gateway",
+    exposed_ports = ["50068/tcp"],
+    repository = "042825952740.dkr.ecr.us-east-1.amazonaws.com/tracker-gateway",
+)
+
+rust_test(
+    name = "tracker_test",
+    crate = ":tracker",
+    edition = "2021",
+)
+
+# The same crate with the `testing` feature on, exposing tracker::testing::
+# FakeTracker + tracker::conformance. A SEPARATE target rather than a feature on
+# :tracker so consumers who only want the contract don't compile the double —
+# while out-of-crate Bazel modules can still depend on it, which a #[cfg(test)]
+# module could never provide.
+rust_library(
+    name = "tracker_testing",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/bin/**"],
+    ),
+    crate_features = ["testing"],
+    crate_name = "tracker",
+    crate_root = "src/lib.rs",
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = [":build_script"] + all_crate_deps(normal = True),
+)
+
+# The contract conformance suite — the executable specification. An adapter is
+# correct when this passes; new contract semantics get a case HERE first, never
+# in an adapter-local test.
+rust_test(
+    name = "conformance",
+    srcs = ["tests/conformance.rs"],
+    edition = "2021",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = [":tracker_testing"] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

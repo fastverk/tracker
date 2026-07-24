@@ -1,0 +1,46 @@
+common --enable_bzlmod
+common --experimental_isolated_extension_usages
+# Auto-apply the `build:linux` / `build:macos` config for the HOST OS — so the
+# linux-only linkopts below land on a plain `bazel test //...` (CI, non-RBE)
+# without touching macOS native builds.
+common --enable_platform_specific_config
+
+common --registry=https://registry.fastverk.com/
+common --registry=https://bcr.bazel.build/
+
+common --action_env=HOME
+
+test --test_output=errors
+test --test_summary=terse
+
+# --config=rbe: build the tracker-gateway OCI image on the fastverk buildbarn RBE
+# (the build-runner injects this + the executor endpoint). The container-image
+# exec property MUST match RbeCluster.spec.worker; //tools/oci:rbe is the exec
+# platform (zig cc + rustc resolve linux/amd64). Mirrors forge/botnoc/agents.
+build:rbe --remote_default_exec_properties=OSFamily=linux
+build:rbe --remote_default_exec_properties=container-image=docker://ghcr.io/catthehacker/ubuntu:act-22.04
+build:rbe --extra_execution_platforms=//tools/oci:rbe
+build:rbe --host_platform=//tools/oci:rbe
+build:rbe --platforms=//tools/oci:linux_amd64
+build:rbe --jobs=64
+build:rbe --remote_timeout=600
+build:rbe --strategy=remote,local
+build:rbe --remote_local_fallback
+
+# protobuf's upb generator uses the `linkarr` encapsulation-symbol pattern
+# (__start_/__stop_linkarr_upb_AllExts); lld's default --gc-sections drops the
+# empty section and leaves those symbols undefined when linking the protoc-gen-upb
+# host tools. zig's cc driver rejects the targeted `-z nostart-stop-gc`, so disable
+# section GC on both the exec (host) and target links. Mirrors forge/botnoc/agents.
+build:rbe --host_linkopt=-Wl,--no-gc-sections
+build:rbe --linkopt=-Wl,--no-gc-sections
+
+# Same upb/linkarr fix for a plain host `bazel test //...` on LINUX (CI ubuntu,
+# which resolves the hermetic zig cc for the protoc-gen-upb host tools). Scoped
+# to linux via --enable_platform_specific_config: macOS builds with the native
+# toolchain (Apple ld rejects --no-gc-sections and has no upb issue), so it must
+# NOT receive these.
+build:linux --host_linkopt=-Wl,--no-gc-sections
+build:linux --linkopt=-Wl,--no-gc-sections
+
+try-import %workspace%/user.bazelrc

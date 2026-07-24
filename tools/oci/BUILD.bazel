@@ -1,0 +1,44 @@
+"""tools/oci — the rust_service_image base + the platforms it cross-compiles under.
+
+Ported from botnoc//tools/oci. The Rust service images (agent-coord, the folded-in
+dispatch) build on the buildbarn RBE: bazel runs on a linux/amd64 worker, so host ==
+target == linux/amd64 and the hermetic zig cc + rustc toolchains (registered in
+MODULE.bazel) resolve for the `linux_amd64` platform below — no in-worker gcc shim.
+"""
+
+package(default_visibility = ["//visibility:public"])
+
+# The rust services are zig gnu.2.28 → glibc dynamically linked, so they need a
+# distroless base WITH glibc + ca-certs. distroless/static (the Go operator's base)
+# would fail to link. @distroless_cc is pulled in MODULE.bazel.
+alias(
+    name = "base_image",
+    actual = "@distroless_cc",
+)
+
+# The linux/amd64 target platform for the rust service images. Pure os+cpu so
+# rules_rust + hermetic_cc resolve the linux toolchains; RBE worker routing is via
+# --remote_default_exec_properties (see .bazelrc build:rbe).
+platform(
+    name = "linux_amd64",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+# The RBE exec platform — same constraints, plus the container-image exec_property
+# that MUST byte-match RbeCluster.spec.worker.platform.containerImage (and the
+# --remote_default_exec_properties=container-image in .bazelrc), or the scheduler
+# returns "No workers exist for … container-image=…".
+platform(
+    name = "rbe",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+    exec_properties = {
+        "OSFamily": "linux",
+        "container-image": "docker://ghcr.io/catthehacker/ubuntu:act-22.04",
+    },
+)

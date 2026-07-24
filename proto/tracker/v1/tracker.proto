@@ -1,0 +1,401 @@
+syntax = "proto3";
+
+// Generic work-tracker contract.
+//
+// The operations a *work tracker* (Linear, Jira, GitHub/GitLab issues, …)
+// provides that an autonomous agent fleet needs: read a backlog, read one item's
+// full text, learn the workspace's projects and workflow states, move an item
+// through those states, comment on it, and link the change that resolves it.
+// Modeled ONCE here so every provider satisfies a single contract and any tool
+// reuses it (DTOs are protos by convention).
+//
+// This is the deliberate sibling of `forge.v1`: `forge.v1.ForgeService` is
+// "where the code lives", `tracker.v1.TrackerService` is "where the work is
+// tracked". They are separate contracts rather than one because a tracker has
+// concepts a code host does not — workflow states, projects, cycles, estimates,
+// sub-items — and because `forge.v1.Issue` is deliberately a thin discovery
+// row, not a work item. GitHub and GitLab issues become ONE ADAPTER here, not
+// the model everyone else is bent to fit.
+//
+// In-process consumers use a hand-written async `Tracker` trait whose methods
+// take/return these message types; the gRPC `TrackerService` is the same
+// contract for the tracker-gateway daemon.
+//
+// ── What is deliberately NOT here ────────────────────────────────────────────
+// Routing a work item to a repository (and to a Bazel blast radius) is NOT a
+// tracker operation. No provider knows it: it is fleet POLICY, expressed by the
+// caller (a campaign's routing table, or a triage agent). Putting it behind this
+// seam would push per-fleet configuration into every adapter and make the
+// contract untestable. `WorkItem` therefore carries the *evidence* a router
+// needs — labels, project, team, free-form text — and stops there.
+
+package tracker.v1;
+
+// ============================================================
+// Instance + item identity
+// ============================================================
+
+// Which work tracker an item lives in.
+//
+// APPEND only — never renumber. Consumers persist these values (a campaign CRD
+// records the tracker its backlog came from), so a renumber silently
+// reinterprets stored records.
+//
+// A consumer that does not recognize a value MUST reject rather than fall back
+// to a default. This rule is inherited verbatim from `forge.v1.Forge`, where
+// answering "gitlab" for anything not GitHub was harmless with two forges and
+// became a wrong-API write with three.
+enum Tracker {
+  TRACKER_UNSPECIFIED = 0;
+  TRACKER_LINEAR = 1;
+  // GitHub issues, via the forge adapters. Kept distinct from GitLab because
+  // the two are different APIs, exactly as in forge.v1.
+  TRACKER_GITHUB_ISSUES = 2;
+  TRACKER_GITLAB_ISSUES = 3;
+  TRACKER_JIRA = 4;
+}
+
+// A tracker INSTANCE — the routing target for the list/describe RPCs.
+//
+// `host` is the deployment ("" = the provider's default SaaS host;
+// "gitlab.savvifi.com" for self-hosted). `workspace` is the top-level tenant:
+// a Linear organization, a Jira site, or a forge owner/group.
+message TrackerRef {
+  Tracker tracker = 1;
+  string host = 2;
+  string workspace = 3;
+}
+
+// One work item's identity.
+//
+// Unlike `forge.v1.ChangeRef` — which is always operated on in the context of a
+// `RepoRef` the caller already holds — a `WorkItemRef` is SELF-CONTAINED and
+// embeds its `TrackerRef`. The difference is deliberate and load-bearing: a
+// campaign persists this reference on a CRD and comes back to it later (to
+// transition the item when its PR merges), possibly in a different process,
+// with no surrounding context to supply the instance.
+message WorkItemRef {
+  // Where this item lives.
+  TrackerRef tracker = 1;
+  // The container within the workspace: a Linear team key ("DEV"), a Jira
+  // project key, or a forge "owner/name". Adapters that have no such level
+  // leave it empty.
+  string project = 2;
+  // The provider's OWN identifier, verbatim — a Linear UUID, a forge issue
+  // number as a string. Opaque; never parsed.
+  string id = 3;
+  // The human-facing key: "DEV-18395", "fastverk/plugin-tbzl#42". Stable and
+  // greppable, so it is what appears in a branch name, a commit trailer, or an
+  // agent's prompt. Adapters MUST populate it; callers MUST NOT parse it to
+  // recover `id`.
+  string key = 4;
+}
+
+// ============================================================
+// Workflow states
+// ============================================================
+
+// The normalized meaning of a provider's workflow state.
+//
+// Providers do not agree on states: Linear workspaces define their own per team,
+// Jira has configurable schemes, GitHub has exactly open/closed. Normalizing to
+// a category — and keeping the provider's own state alongside it — is what lets
+// a caller say "move this to In Progress" without knowing the workspace's
+// vocabulary, while a UI can still show the real state name.
+//
+// APPEND only, same rule as `Tracker`.
+enum StateCategory {
+  STATE_CATEGORY_UNSPECIFIED = 0;
+  STATE_CATEGORY_BACKLOG = 1;
+  STATE_CATEGORY_TODO = 2;
+  STATE_CATEGORY_IN_PROGRESS = 3;
+  STATE_CATEGORY_DONE = 4;
+  STATE_CATEGORY_CANCELED = 5;
+}
+
+// One workflow state as the workspace defines it.
+message WorkItemState {
+  // The provider's state id, verbatim. Opaque.
+  string id = 1;
+  // The workspace's own name for it: "In Progress", "In Review", "Done".
+  string name = 2;
+  // What that name MEANS, normalized.
+  StateCategory category = 3;
+}
+
+// Normalized priority. Matches Linear's scale exactly (0 none, 1 urgent … 4
+// low); adapters whose provider has no priority leave it UNSPECIFIED rather
+// than inventing a middle value.
+enum Priority {
+  PRIORITY_UNSPECIFIED = 0;
+  PRIORITY_URGENT = 1;
+  PRIORITY_HIGH = 2;
+  PRIORITY_MEDIUM = 3;
+  PRIORITY_LOW = 4;
+}
+
+// ============================================================
+// The work item
+// ============================================================
+
+// One unit of tracked work.
+message WorkItem {
+  WorkItemRef ref = 1;
+
+  string title = 2;
+  // The full body, in the provider's markdown. This is the text an agent is
+  // actually briefed from, so adapters MUST NOT truncate it — a list RPC that
+  // cannot afford full bodies should leave it empty and let the caller
+  // `GetWorkItem`, rather than return a silently clipped brief.
+  string description = 3;
+
+  WorkItemState state = 4;
+  Priority priority = 5;
+
+  repeated string labels = 6;
+  // Display name or handle; "" when unassigned.
+  string assignee = 7;
+  string author = 8;
+
+  // Provider estimate in its own unit (points, days). 0 = unset. Advisory: it
+  // is a planning signal, never a budget the scheduler enforces.
+  double estimate = 9;
+
+  // Web URL for a human to open.
+  string url = 10;
+  // RFC 3339.
+  string created_at = 11;
+  string updated_at = 12;
+
+  // The branch name the PROVIDER expects for its own change-linking to fire —
+  // Linear's `gitBranchName` ("dev-18395"). Load-bearing, not decorative: an
+  // agent that names its branch anything else gets an attachment at best and no
+  // state transition at all. Empty when the provider has no such convention.
+  string git_branch_name = 13;
+
+  // Parent item, when the provider models sub-items. Unset at the root.
+  WorkItemRef parent = 14;
+
+  // Changes already linked to this item, as forge refs
+  // ("fastverk/plugin-tbzl#5", "aion/web!75"). Lets a resuming campaign see
+  // that it already opened a PR for this item.
+  repeated string change_refs = 15;
+
+  // Human-facing grouping, when the provider has one distinct from `project`:
+  // a Linear project, a Jira epic. Free-form; router evidence, not routing.
+  string group = 16;
+  // The iteration this sits in: a Linear cycle, a Jira sprint. Free-form.
+  string cycle = 17;
+}
+
+// A container of work items: a Linear team, a Jira project, a forge repo.
+message Project {
+  TrackerRef tracker = 1;
+  // The key used in `WorkItemRef.project`.
+  string key = 2;
+  string name = 3;
+  string url = 4;
+}
+
+// ============================================================
+// Query
+// ============================================================
+
+// A backlog query. Every field is a narrowing filter; all are ANDed, and an
+// empty field means "no constraint on this dimension".
+//
+// Adapters MUST apply every field they claim to support in
+// `TrackerCapabilities`, server-side where the provider allows it and in-process
+// otherwise. Silently ignoring a filter is the one failure mode that turns a
+// campaign into unbounded fan-out over an entire backlog, so an adapter that
+// cannot apply a set field MUST fail rather than over-return.
+message WorkItemQuery {
+  // Project keys (Linear team keys, forge "owner/name"). Empty = the whole
+  // workspace.
+  repeated string projects = 1;
+  // Normalized state categories. Empty = every category INCLUDING done and
+  // canceled — callers driving a fan-out almost always want [TODO] or
+  // [BACKLOG, TODO].
+  repeated StateCategory state_categories = 2;
+  // Labels the item must carry (ALL of them — an "agent/ready" gate is the
+  // intended use).
+  repeated string labels = 3;
+  // Assignee handles; empty = any, including unassigned.
+  repeated string assignees = 4;
+  // RFC 3339 lower bound on `updated_at`.
+  string updated_since = 5;
+  // Free-text search over title + description. Gated on
+  // `TrackerCapabilities.text_search`.
+  string text = 6;
+  // Minimum priority (i.e. numerically <= this, since 1 is most urgent).
+  // UNSPECIFIED = no constraint.
+  Priority min_priority = 7;
+}
+
+// ============================================================
+// Capabilities
+// ============================================================
+
+// What THIS adapter answers for — not what the product advertises.
+//
+// The distinction is the same one `forge.v1.ForgeCapabilities` draws: "Jira has
+// sub-tasks" is true and useless; what a caller needs to know is whether this
+// server will answer `TransitionWorkItem` for this instance. Only the
+// adapter-scoped reading makes skipping a surface safe, which is the point.
+message TrackerCapabilities {
+  bool transitions = 1;
+  bool comments = 2;
+  bool link_changes = 3;
+  bool projects = 4;
+  bool estimates = 5;
+  bool sub_items = 6;
+  // Whether `WorkItem.git_branch_name` is populated and meaningful.
+  bool git_branch_names = 7;
+  // Whether `WorkItemQuery.text` is honored.
+  bool text_search = 8;
+  // Whether `WorkItemQuery.labels` is honored.
+  bool labels = 9;
+}
+
+// ============================================================
+// Requests / responses
+// ============================================================
+
+message ListWorkItemsRequest {
+  TrackerRef tracker = 1;
+  WorkItemQuery query = 2;
+  // Max items to return. 0 = the adapter's default. AIP-158.
+  int32 page_size = 3;
+  // Opaque continuation from a prior response.
+  string page_token = 4;
+}
+
+message ListWorkItemsResponse {
+  repeated WorkItem items = 1;
+  // Empty when the backlog is exhausted.
+  string next_page_token = 2;
+}
+
+message GetWorkItemRequest {
+  WorkItemRef item = 1;
+}
+
+message GetWorkItemResponse {
+  WorkItem item = 1;
+}
+
+message ListProjectsRequest {
+  TrackerRef tracker = 1;
+}
+
+message ListProjectsResponse {
+  repeated Project projects = 1;
+}
+
+message ListStatesRequest {
+  TrackerRef tracker = 1;
+  // Restrict to one project's workflow. Empty = every state in the workspace,
+  // which for providers with per-team workflows may contain same-named states
+  // with distinct ids.
+  string project = 2;
+}
+
+message ListStatesResponse {
+  repeated WorkItemState states = 1;
+}
+
+message TransitionWorkItemRequest {
+  WorkItemRef item = 1;
+  // Where to move it. Exactly one must be set.
+  oneof target {
+    // An explicit provider state id, from `ListStates`.
+    string state_id = 2;
+    // A normalized category the adapter resolves against the item's own
+    // project workflow. This is the form a fleet controller uses: it wants "in
+    // progress" without learning each workspace's vocabulary. An adapter with
+    // several states in the category MUST pick the workspace's default one and
+    // report which in the response, never guess silently.
+    StateCategory category = 3;
+  }
+}
+
+message TransitionWorkItemResponse {
+  // The state the item is in AFTER the call. When the item was already there,
+  // this is that state and `changed` is false — the operation is idempotent, so
+  // a resuming reconcile loop can call it repeatedly.
+  WorkItemState state = 1;
+  bool changed = 2;
+}
+
+message CommentOnWorkItemRequest {
+  WorkItemRef item = 1;
+  string body = 2;
+  // Idempotency: when set, an adapter that finds an existing comment carrying
+  // this key MUST return it rather than post a second one. A crash-looping
+  // reconcile posting the same "agent started work" note forty times is the
+  // failure this prevents. Adapters store it as a hidden marker in the body.
+  string idempotency_key = 3;
+}
+
+message CommentOnWorkItemResponse {
+  // Provider comment id.
+  string id = 1;
+  string url = 2;
+  // False when an existing comment with the same `idempotency_key` was returned.
+  bool created = 3;
+}
+
+message LinkChangeRequest {
+  WorkItemRef item = 1;
+  // The change's web URL — the only universally linkable handle.
+  string url = 2;
+  // Forge ref ("fastverk/plugin-tbzl#5", "aion/web!75") when the caller has it;
+  // adapters that model links richly use it for the title.
+  string change_ref = 3;
+  // Human title for the link.
+  string title = 4;
+}
+
+message LinkChangeResponse {
+  string id = 1;
+  // False when the link already existed — idempotent by `url`.
+  bool created = 2;
+}
+
+message GetCapabilitiesRequest {
+  TrackerRef tracker = 1;
+}
+
+message GetCapabilitiesResponse {
+  TrackerCapabilities capabilities = 1;
+}
+
+// ============================================================
+// Service
+// ============================================================
+
+// The generic work-tracker service. Linear, Jira and the forge-issue adapters
+// implement these.
+//
+// CREDENTIALS: the daemon serving this holds NONE of its own. The caller's
+// identity travels in request metadata (`x-fastverk-linear-token`, …) exactly
+// as it does for forge-gateway, so every operation runs as the caller and
+// adding a provider never means giving a shared service a new standing secret.
+service TrackerService {
+  // ── read ──────────────────────────────────────────────────────────────────
+  rpc ListWorkItems(ListWorkItemsRequest) returns (ListWorkItemsResponse);
+  rpc GetWorkItem(GetWorkItemRequest) returns (GetWorkItemResponse);
+  rpc ListProjects(ListProjectsRequest) returns (ListProjectsResponse);
+  rpc ListStates(ListStatesRequest) returns (ListStatesResponse);
+
+  // ── write ─────────────────────────────────────────────────────────────────
+  // All three are idempotent, so a resuming reconcile loop can call them
+  // repeatedly without duplicating state.
+  rpc TransitionWorkItem(TransitionWorkItemRequest) returns (TransitionWorkItemResponse);
+  rpc CommentOnWorkItem(CommentOnWorkItemRequest) returns (CommentOnWorkItemResponse);
+  rpc LinkChange(LinkChangeRequest) returns (LinkChangeResponse);
+
+  // What this adapter provides. Ask before attempting an optional surface; see
+  // TrackerCapabilities.
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+}

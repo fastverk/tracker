@@ -1,0 +1,50 @@
+# Standalone crate (built by Bazel; this table keeps a bare `cargo` invocation
+# from being captured by an ancestor workspace — same as the sibling forge/fvkit
+# repos).
+[workspace]
+
+[package]
+name = "fastverk-tracker"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.95.0"
+license = "MIT"
+repository = "https://github.com/fastverk/tracker"
+description = "Generic work-tracker contract (TrackerService) + Linear adapter."
+
+[lib]
+name = "tracker"
+path = "src/lib.rs"
+
+[dependencies]
+tonic = "0.12"
+prost = "0.13"
+tokio = { version = "1.40", features = ["full"] }
+anyhow = "1.0"
+thiserror = "1.0"
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+http = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = []
+# Exposes `tracker::testing::FakeTracker` — the in-memory contract double, and
+# `tracker::conformance` — the executable specification. Non-default so
+# consumers don't carry them, but a REAL feature rather than `#[cfg(test)]` so
+# out-of-crate Bazel modules (an adapter living in its own repo) can run the
+# shared battery. See forge, where a copied suite proved exactly nothing.
+testing = []
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+# The conformance suite drives the async trait directly.
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread"] }

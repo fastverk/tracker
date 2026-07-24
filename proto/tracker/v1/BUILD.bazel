@@ -1,0 +1,7 @@
+package(default_visibility = ["//visibility:public"])
+
+# Compiled by build.rs (tonic-build); exported so the cargo_build_script can
+# data-dep the file. Out-of-module consumers (the agents campaign controller,
+# plugin-tracker) should data-dep this label rather than vendor a copy — the
+# drift hazard forge.proto's hard rule 3 exists to prevent.
+exports_files(["tracker.proto"])
