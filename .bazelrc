@@ -18,7 +18,7 @@ test --test_summary=terse
 # exec property MUST match RbeCluster.spec.worker; //tools/oci:rbe is the exec
 # platform (zig cc + rustc resolve linux/amd64). Mirrors forge/botnoc/agents.
 build:rbe --remote_default_exec_properties=OSFamily=linux
-build:rbe --remote_default_exec_properties=container-image=docker://ghcr.io/catthehacker/ubuntu:act-22.04
+build:rbe --remote_default_exec_properties=container-image=docker://042825952740.dkr.ecr.us-east-1.amazonaws.com/tbzl-rbe-worker:act-22.04-libtinfo5-py3
 build:rbe --extra_execution_platforms=//tools/oci:rbe
 build:rbe --host_platform=//tools/oci:rbe
 build:rbe --platforms=//tools/oci:linux_amd64
