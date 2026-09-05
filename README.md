@@ -1,3 +1,19 @@
+> [!IMPORTANT]
+> **This repository is retired.** `tracker` is developed in the
+> [`fastverk/platform`](https://github.com/fastverk/platform) ship vehicle, at
+> [`tracker/`](https://github.com/fastverk/platform/tree/main/tracker). Open issues
+> and pull requests there.
+>
+> The published module is unchanged — `bazel_dep(name = "tracker", version = "0.0.4")`
+> resolves exactly as before. This remote keeps its full history and every tag, so
+> existing registry entries and `git_override` pins stay valid. The `tracker.v1`
+> protos are published from
+> [`fastverk/contracts`](https://github.com/fastverk/contracts).
+>
+> Retired at [`3927db9`](https://github.com/fastverk/tracker/commit/3927db97f7904e5362271187177175b82a39a005),
+> the commit the vehicle imported — nothing here is unimported. Background:
+> [Consolidation](https://docs.fastverk.com/consolidation.html).
+
 # tracker
 
 Generic work-tracker contract (`TrackerService`) + provider adapters.
