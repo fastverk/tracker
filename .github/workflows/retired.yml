@@ -1,0 +1,58 @@
+# fastverk/tracker is retired. `tracker` is developed in the fastverk/platform
+# ship vehicle, under tracker/.
+#
+# This check fails on any pull request that changes something other than the
+# retirement notice itself, so a contributor -- or an agent -- finds out they
+# opened the wrong tree before spending a review cycle in it.
+#
+# It is a signal, not a lock. The fix is to land the change in the vehicle, not
+# to merge over this.
+#
+# Deliberately not on `push`: a direct push to a retired default branch is an
+# admin action by someone who already knows, and a permanently red main would
+# only generate noise.
+#
+# Retired at 3927db97f7904e5362271187177175b82a39a005 — the exact commit
+# fastverk/platform imported, so nothing here is unimported.
+
+name: retired
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  retired:
+    name: retired — develop in fastverk/platform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `git diff A...B` needs the merge base, not a shallow tip.
+          fetch-depth: 0
+      - name: fail on changes outside the retirement notice
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"
+          offending="$(printf '%s\n' "$changed" \
+            | grep -vxF -e 'README.md' -e '.github/workflows/retired.yml' || true)"
+          offending="$(printf '%s' "$offending" | sed '/^$/d')"
+          if [ -z "$offending" ]; then
+            echo "Only the retirement notice changed — allowed."
+            exit 0
+          fi
+          echo "::error title=fastverk/tracker is retired::Develop tracker in fastverk/platform under tracker/ — https://docs.fastverk.com/consolidation.html"
+          echo
+          echo "This repository is retired. These paths must change in the vehicle instead:"
+          printf '%s\n' "$offending" | sed 's/^/    /'
+          echo
+          echo "  vehicle : https://github.com/fastverk/platform"
+          echo "  path    : tracker/"
+          echo "  module  : bazel_dep(name = \"tracker\", version = \"0.0.4\")  (unchanged)"
+          echo "  protos  : tracker.v1 is published from fastverk/contracts"
+          exit 1
